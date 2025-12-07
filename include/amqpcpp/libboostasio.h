@@ -23,6 +23,8 @@
 /**
  *  Dependencies
  */
+#include <functional>
+#include <map>
 #include <memory>
 
 #include <boost/asio/io_context.hpp>
@@ -30,17 +32,8 @@
 #include <boost/asio/deadline_timer.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <boost/asio/dispatch.hpp>
-#include <boost/bind/bind.hpp>
-#include <boost/function.hpp>
 
 #include "amqpcpp/linux_tcp.h"
-
-// C++17 has 'weak_from_this()' support.
-#if __cplusplus >= 201701L
-#define PTR_FROM_THIS(T) weak_from_this()
-#else
-#define PTR_FROM_THIS(T) std::weak_ptr<T>(shared_from_this())
-#endif
 
 /**
  *  Set up namespace
@@ -113,9 +106,9 @@ protected:
          */
         bool _write_pending{false};
 
-        using handler_cb = boost::function<void(boost::system::error_code,std::size_t)>;
-        using io_handler = boost::function<void(const boost::system::error_code&, const std::size_t)>;
-        using timer_handler = boost::function<void(boost::system::error_code)>;
+        using handler_cb = std::function<void(boost::system::error_code, std::size_t)>;
+        using io_handler = std::function<void(const boost::system::error_code&, const std::size_t)>;
+        using timer_handler = std::function<void(boost::system::error_code)>;
 
         /**
          * Builds a io handler callback that executes the io callback in a strand.
@@ -124,17 +117,25 @@ protected:
          */
         handler_cb get_dispatch_wrapper(io_handler fn)
         {
+            // Use weak_ptr to strand to prevent circular dependencies or leaks
             const strand_weak_ptr wpstrand = _wpstrand;
 
-            return [fn, wpstrand](const boost::system::error_code &ec, const std::size_t bytes_transferred)
+            return [fn{std::move(fn)}, wpstrand](const boost::system::error_code &ec, const std::size_t bytes_transferred)
             {
-                const strand_shared_ptr strand = wpstrand.lock();
+                const auto strand = wpstrand.lock();
                 if (!strand)
                 {
-                    fn(boost::system::errc::make_error_code(boost::system::errc::operation_canceled), std::size_t{0});
+                    // If the strand is gone, the handler is shutting down.
+                    // Execute the function with operation_canceled to allow cleanup if needed,
+                    // or just return (depending on library semantics).
+                    fn(boost::asio::error::operation_aborted, 0); 
                     return;
                 }
-                boost::asio::dispatch(strand->context().get_executor(), boost::bind(fn, ec, bytes_transferred));
+
+                boost::asio::dispatch(strand->context().get_executor(), 
+                                      [fn, ec, bytes_transferred]() {
+                                          fn(ec, bytes_transferred);
+                });
             };
         }
 
@@ -146,14 +147,11 @@ protected:
          */
         handler_cb get_read_handler(TcpConnection *const connection, const int fd)
         {
-            auto fn = boost::bind(&Watcher::read_handler,
-                                  this,
-                                  boost::placeholders::_1,
-                                  boost::placeholders::_2,
-                                  PTR_FROM_THIS(Watcher),
-                                  connection,
-                                  fd);
-            return get_dispatch_wrapper(fn);
+            auto self = weak_from_this();
+            auto fn = [this, self{std::move(self)}, connection, fd](const boost::system::error_code &ec, const std::size_t bytes) {
+                this->read_handler(ec, bytes, self, connection, fd);
+            };
+            return get_dispatch_wrapper(std::move(fn));
         }
 
         /**
@@ -164,42 +162,45 @@ protected:
          */
         handler_cb get_write_handler(TcpConnection *const connection, const int fd)
         {
-            auto fn = boost::bind(&Watcher::write_handler,
-                                  this,
-                                  boost::placeholders::_1,
-                                  boost::placeholders::_2,
-                                  PTR_FROM_THIS(Watcher),
-                                  connection,
-                                  fd);
-            return get_dispatch_wrapper(fn);
+            auto self = weak_from_this();
+            auto fn = [this, self{std::move(self)}, connection, fd](const boost::system::error_code &ec, const std::size_t bytes) {
+                this->write_handler(ec, bytes, self, connection, fd);
+            };
+            return get_dispatch_wrapper(std::move(fn));
         }
 
         /**
-         * Binds and returns a lamba function handler for the io operation.
+         * Binds and returns a lambda function handler for the io operation.
          * @param  connection   The connection being watched.
          * @param  timeout      The file descripter being watched.
          * @return handler callback
          */
         timer_handler get_timer_handler(TcpConnection *const connection, const uint16_t timeout)
         {
-            const auto fn = boost::bind(&Watcher::timeout_handler,
-                                  this,
-                                  boost::placeholders::_1,
-                                  PTR_FROM_THIS(Watcher),
-                                  connection,
-                                  timeout);
+            auto self = weak_from_this();
+            
+            // The actual logic that runs when timer fires
+            auto fn = [this, self{std::move(self)}, connection, timeout](const boost::system::error_code &ec) {
+                this->timeout_handler(ec, self, connection, timeout);
+            };
 
             const strand_weak_ptr wpstrand = _wpstrand;
 
-            return [fn, wpstrand](const boost::system::error_code &ec)
+            // The dispatch wrapper
+            return [fn{std::move(fn)}, wpstrand](const boost::system::error_code &ec)
             {
-                const strand_shared_ptr strand = wpstrand.lock();
+                auto strand = wpstrand.lock();
                 if (!strand)
                 {
-                    fn(boost::system::errc::make_error_code(boost::system::errc::operation_canceled));
+                    // If strand is dead, we cannot safely execute the callback
                     return;
                 }
-                boost::asio::dispatch(strand->context().get_executor(), boost::bind(fn, ec));
+                
+                // Dispatch ensuring thread safety via strand
+                boost::asio::dispatch(strand->context().get_executor(), 
+                    [fn, ec]() { 
+                        fn(ec); 
+                    });
             };
         }
 
@@ -213,7 +214,7 @@ protected:
          *  @note   The handler will get called if a read is cancelled.
          */
         void read_handler(const boost::system::error_code &ec,
-                          const std::size_t bytes_transferred,
+                          const std::size_t /*bytes_transferred*/, // Stops: -Wunused-parameter
                           const std::weak_ptr<Watcher> awpWatcher,
                           TcpConnection *const connection,
                           const int fd)
@@ -247,7 +248,7 @@ protected:
          *  @note   The handler will get called if a write is cancelled.
          */
         void write_handler(const boost::system::error_code ec,
-                           const std::size_t bytes_transferred,
+                           const std::size_t /*bytes_transferred*/, // Stops: -Wunused-parameter
                            const std::weak_ptr<Watcher> awpWatcher,
                            TcpConnection *const connection,
                            const int fd)
