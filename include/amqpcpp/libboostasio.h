@@ -23,11 +23,12 @@
 /**
  *  Dependencies
  */
+#include <chrono>
 #include <memory>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/strand.hpp>
-#include <boost/asio/deadline_timer.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/bind/bind.hpp>
@@ -84,10 +85,10 @@ protected:
         boost::asio::posix::stream_descriptor _socket;
 
         /**
-         *  The boost asynchronous deadline timer.
-         *  @var class boost::asio::deadline_timer
+         *  The boost asynchronous steady timer.
+         *  @var class boost::asio::steady_timer
          */
-        boost::asio::deadline_timer _timer;
+        boost::asio::steady_timer _timer;
 
         /**
          *  A boolean that indicates if the watcher is monitoring for read events.
@@ -297,7 +298,7 @@ protected:
                 }
 
                 // Reschedule the timer for the future:
-                _timer.expires_at(_timer.expires_at() + boost::posix_time::seconds(timeout));
+                _timer.expires_at(_timer.expiry() + std::chrono::seconds(timeout));
 
                 // Posts the timer event
                 _timer.async_wait(get_timer_handler(connection, timeout));
@@ -388,7 +389,7 @@ protected:
             stop_timer();
 
             // Reschedule the timer for the future:
-            _timer.expires_from_now(boost::posix_time::seconds(timeout));
+            _timer.expires_after(std::chrono::seconds(timeout));
 
             // Posts the timer event
             _timer.async_wait(get_timer_handler(connection, timeout));
